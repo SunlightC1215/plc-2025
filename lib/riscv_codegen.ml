@@ -204,21 +204,21 @@ let rec gen_expr env depth e =
       let reg1, code1 = gen_expr env depth a in
       let reg2, code2 = gen_expr env (depth+1) b in
       let reg = reg_tmp.(depth mod Array.length reg_tmp) in
-      let opstr, extra =
-        match op with
-        | Add -> "add", ""
-        | Sub -> "sub", ""
-        | Mul -> "mul", ""
-        | Div -> "div", ""
-        | Mod -> "rem", ""
-        | Lt  -> "slt", ""
-        | Gt  -> "sgt", ""
-        | Le  -> "sle", ""
-        | Ge  -> "sge", ""
-        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
-        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
-        | And -> "and", ""
-        | Or  -> "or", ""
+let opstr, extra =
+  match op with
+  | Add -> "add", ""
+  | Sub -> "sub", ""
+  | Mul -> "mul", ""
+  | Div -> "div", ""
+  | Mod -> "rem", ""
+  | Lt  -> "slt", ""
+  | Gt  -> "sgt", ""
+  | Le  -> "slt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b 实现为 !(b < a) *)
+  | Ge  -> "slt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a >= b 实现为 !(a < b) *)
+  | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
+  | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
+  | And -> "and", ""
+  | Or  -> "or", ""
       in
       let code =
         code1 @ code2 @
