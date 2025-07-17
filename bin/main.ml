@@ -1,3 +1,5 @@
+open Toyc_lib
+
 let () =
   (* 读取所有标准输入内容，直到 EOF *)
   let source =
