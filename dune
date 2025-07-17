@@ -1,0 +1,11 @@
+(executable
+ (name main)
+ (modules ast lexer parser semantic riscv_codegen main)
+ (libraries menhirLib)
+)
+
+(menhir
+ (modules parser))
+
+ (ocamllex
+ (modules lexer))
