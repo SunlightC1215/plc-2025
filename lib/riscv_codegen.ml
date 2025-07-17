@@ -200,38 +200,28 @@ let rec gen_expr env depth e =
       let reg = reg_tmp.(depth mod Array.length reg_tmp) in
       let ofs = find_var env x in
       (reg, [Printf.sprintf "lw %s, %d(fp)" reg ofs])
-  | BinOp (op,a,b) ->
-      let reg1, code1 = gen_expr env depth a in
-      let reg2, code2 = gen_expr env (depth+1) b in
-      let reg = reg_tmp.(depth mod Array.length reg_tmp) in
-      let opstr, extra =
-        match op with
-        | Add -> "add", ""
-        | Sub -> "sub", ""
-        | Mul -> "mul", ""
-        | Div -> "div", ""
-        | Mod -> "rem", ""
-        | Lt  -> "slt", ""
-        | Gt  -> "sgt", ""
-        | Le  -> "slt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b 实现为 !(b < a) *)
-        | Ge  -> "sge", ""
-        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
-        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
-        | And -> "and", ""
-        | Or  -> "or", ""
-      in
-      let code =
-        if op = Le then
-          (* 对于 Le，我们需要交换操作数的顺序 *)
-          code1 @ code2 @
-          [Printf.sprintf "%s %s, %s, %s%s"
-            opstr reg reg2 reg1 extra]  (* 注意 reg2 和 reg1 交换了 *)
-        else
-          code1 @ code2 @
-          [Printf.sprintf "%s %s, %s, %s%s"
-            opstr reg reg1 reg2 extra]
-      in
-      (reg, code)
+  | BinOp (op, a, b) ->
+    let reg1, code1 = gen_expr env depth a in
+    let reg2, code2 = gen_expr env (depth + 1) b in
+    let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+    let opstr, extra =
+      match op with
+      | Add -> "add", ""
+      | Sub -> "sub", ""
+      | Mul -> "mul", ""
+      | Div -> "div", ""
+      | Mod -> "rem", ""
+      | Lt  -> "slt", ""
+      | Gt  -> "sgt", ""
+      | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b ≡ !(a > b) *)
+      | Ge  -> "sge", ""
+      | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
+      | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
+      | And -> "and", ""
+      | Or  -> "or", ""
+    in
+    let code = code1 @ code2 @ [Printf.sprintf "%s %s, %s, %s%s" opstr reg reg1 reg2 extra] in
+    (reg, code)
   | UnOp (Neg, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code @ [Printf.sprintf "neg %s, %s" reg reg])
