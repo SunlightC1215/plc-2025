@@ -213,8 +213,10 @@ let opstr, extra =
   | Mod -> "rem", ""
   | Lt  -> "slt", ""
   | Gt  -> "sgt", ""
-  | Le  -> "slt", Printf.sprintf "\nxori %s, %s, 1" reg reg  (* a <= b 实现为 !(b < a) *)
-  | Ge  -> "slt", Printf.sprintf "\nxori %s, %s, 1" reg reg  (* a >= b 实现为 !(a < b) *)
+ | Le ->  "slt", Printf.sprintf "\nslt %s, %s, %s\nxori %s, %s, 1" reg reg2 reg1 reg reg
+
+  | Ge ->  "slt", Printf.sprintf "\nslt %s, %s, %s\nxori %s, %s, 1" reg reg1 reg2 reg reg
+
   | Eq  -> "sub", Printf.sprintf "\nseqz %s, %s" reg reg
   | Neq -> "sub", Printf.sprintf "\nsnez %s, %s" reg reg
   | And -> "and", ""
