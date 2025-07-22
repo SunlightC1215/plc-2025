@@ -1,7 +1,7 @@
 open Ast
 
 module StringMap = Map.Make(String)
-
+module VarEnv = Map.Make(String)
 type vinfo = {
   v_ty: [`Int];
   initialized: bool;
