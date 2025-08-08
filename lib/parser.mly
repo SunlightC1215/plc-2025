@@ -69,8 +69,8 @@ expr2:
   | expr2 NEQ expr3 { BinOp(Neq, $1, $3) }
   | expr2 LT expr3 { BinOp(Lt, $1, $3) }
   | expr2 GT expr3 { BinOp(Gt, $3, $1) }
-  | expr2 LE expr3 { BinOp(Le, $3, $1) }
-  | expr2 GE expr3 { BinOp(Ge, $1, $3) }
+  | expr2 LE expr3 { BinOp(Le, $1, $3) }
+  | expr2 GE expr3 { BinOp(Ge, $3, $1) }
   | expr3 { $1 }
 
 expr3:
