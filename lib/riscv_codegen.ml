@@ -17,18 +17,7 @@ type fsign = {
   ret_ty: [ `Int | `Void ];
   params: string list;
 }
-let rec ends_with_return stmt =
-  match stmt with
-  | Return _ -> true
-  | Block stmts -> 
-      (* 如果语句块的最后一条语句是 Return *)
-      List.exists ends_with_return stmts
-  | If (_, then_blk, Some else_blk) ->
-      (* 只有 if-else 的两个分支都以 Return 结尾时才返回 true *)
-      ends_with_return then_blk && ends_with_return else_blk
-  | If (_, then_blk, None) ->
-      ends_with_return then_blk
-  | _ -> false  (* 其他语句不会导致函数返回 *)
+
 let global_funcs : func list ref = ref []
 
 type senv = {
