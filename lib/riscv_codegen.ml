@@ -17,7 +17,18 @@ type fsign = {
   ret_ty: [ `Int | `Void ];
   params: string list;
 }
-
+let rec ends_with_return stmt =
+  match stmt with
+  | Return _ -> true
+  | Block stmts -> 
+      (* 如果语句块的最后一条语句是 Return *)
+      List.exists ends_with_return stmts
+  | If (_, then_blk, Some else_blk) ->
+      (* 只有 if-else 的两个分支都以 Return 结尾时才返回 true *)
+      ends_with_return then_blk && ends_with_return else_blk
+  | If (_, then_blk, None) ->
+      ends_with_return then_blk
+  | _ -> false  (* 其他语句不会导致函数返回 *)
 let global_funcs : func list ref = ref []
 
 type senv = {
@@ -335,51 +346,55 @@ let rec gen_stmt env depth code s =
       ]
 
 let gen_func (f : func) =
+  (* --------------------------------------------------------------- *)
+  (* 1. 创建函数环境并分配所有形参的栈槽（仅记录偏移，不生成代码） *)
   let env = push_env () in
-  let prologue = ref [] in
-  (* 参数分配 *)
-  List.iteri (fun i name ->
-    let ofs = alloc_var env name in
-    prologue := !prologue @ [Printf.sprintf "sw a%d, %d(fp)" i ofs]
-  ) f.params;
-  
-  (* 计算需要的栈空间大小 *)
-  let stack_size = 
-    let params_size = List.length f.params * word_size in
-    let locals_size = -env.cur_offset in
-    (* 对齐到16字节边界，并保留ra和fp的空间 *)
-    ((params_size + locals_size + 15) / 16) * 16
-  in
-  
+  List.iteri (fun _ name -> ignore (alloc_var env name)) f.params;
+
+  (* 2. 为本函数生成唯一的返回标签，并放进环境 *)
   let ret_label = fresh_label (f.name ^ "_ret") in
   env.ret_label <- ret_label;
-  
+
+  (* 3. 递归生成函数体代码。期间会为所有局部变量再次调用 alloc_var， 
++      从而把 env.cur_offset 拉得更负，完整记录“参数+局部变量”占用了多少空间。 *)
   let body_code = List.fold_left (fun acc s -> gen_stmt env 0 acc s) [] f.body in
-  
-  let code = ref [] in
-  code := !code @ [Printf.sprintf ".globl %s" f.name; Printf.sprintf "%s:" f.name];
-  
-  (* 新的prologue *)
-  code := !code @ [
-    Printf.sprintf "addi sp, sp, -%d" stack_size;
-    "sw ra, 0(sp)";
-    "sw fp, 4(sp)";
-    Printf.sprintf "addi fp, sp, %d" (stack_size - 8)  (* fp指向保存的ra和fp之上 *)
-  ];
-  
-  code := !code @ !prologue;
-  code := !code @ body_code;
-  
-  (* epilogue *)
-  code := !code @ [Printf.sprintf "%s:" ret_label];
-  code := !code @ [
+
+  (* 4. 依据 env.cur_offset 计算实际需要的栈空间大小。               *)
+  (*    - env.cur_offset 现在是一个负数，   -env.cur_offset = 参数+局部变量的字节数 *)
+  (*    - 再加上保存 ra/fp 的 8 字节以及 16 字节对齐要求。          *)
+  let used_bytes = -env.cur_offset in               (* 参数 + 局部变量的总字节数 *)
+  let stack_size = ((used_bytes + 8 + 15) / 16) * 16 in
+
+  (* 5. 生成函数序言（prologue） *)
+  let prologue = [
+    Printf.sprintf ".globl %s" f.name;
+    Printf.sprintf "%s:" f.name;
+    Printf.sprintf "addi sp, sp, -%d" stack_size;   (* 为整个栈帧预留空间 *)
+    "sw ra, 0(sp)";                               (* 保存返回地址 *)
+    "sw fp, 4(sp)";                               (* 保存旧的帧指针 *)
+    Printf.sprintf "addi fp, sp, %d" (stack_size - 8) (* fp 指向保存 ra/fp 之上的位置 *)
+  ] in
+
+  (* 6. 将形参保存到栈槽中。此时 fp 已经就位，偏移量已经在 env.stack_offset 里 *)
+  let param_store =
+    List.mapi (fun i name ->
+        let ofs = Hashtbl.find env.stack_offset name in
+        Printf.sprintf "sw a%d, %d(fp)" i ofs
+      ) f.params
+  in
+
+  (* 7. 生成函数尾声（epilogue） *)
+  let epilogue = [
+    Printf.sprintf "%s:" ret_label;
     "lw ra, 0(sp)";
     "lw fp, 4(sp)";
     Printf.sprintf "addi sp, sp, %d" stack_size;
     "ret"
-  ];
-  
-  String.concat "\n" !code
+  ] in
+
+  (* 8. 把所有片段拼接起来返回 *)
+  String.concat "\n"
+    (prologue @ param_store @ body_code @ epilogue)
 
 let gen_program (prog : program) : string =
   String.concat "\n\n" (List.map gen_func prog)
