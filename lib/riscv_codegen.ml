@@ -17,16 +17,6 @@ type fsign = {
   ret_ty: [ `Int | `Void ];
   params: string list;
 }
-
-let global_funcs : func list ref = ref []
-
-type senv = {
-  vars: (string, vinfo) Hashtbl.t;
-  parent: senv option;
-  breakable: bool;
-  cur_func: fsign option;
-}
-
 let rec ends_with_return stmt =
   match stmt with
   | Return _ -> true
@@ -39,7 +29,15 @@ let rec ends_with_return stmt =
   | If (_, then_blk, None) ->
       ends_with_return then_blk
   | _ -> false  (* 其他语句不会导致函数返回 *)
-  
+let global_funcs : func list ref = ref []
+
+type senv = {
+  vars: (string, vinfo) Hashtbl.t;
+  parent: senv option;
+  breakable: bool;
+  cur_func: fsign option;
+}
+
 let rec find_var env name =
   match Hashtbl.find_opt env.vars name with
   | Some v -> Some v
@@ -246,19 +244,7 @@ let rec gen_expr env depth e =
       (reg, code)
   | Call (fname, args) ->
       let code = ref [] in
-      
-      (* 保存参数寄存器 *)
-      List.iteri (fun i _ ->
-        code := !code @ [Printf.sprintf "sw a%d, %d(sp)" i (-(i+1)*word_size)]
-      ) args;
-      
-      (* 设置参数 *)
-      List.iteri (fun i arg ->
-        let reg, c = gen_expr env (depth + i + 1) arg in
-        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
-      ) args;
-      
-      (* 保存调用者保存的寄存器 *)
+      (* 保存可能被调用破坏的临时寄存器 *)
       let saved_regs = ref [] in
       for i = 0 to depth do
         let reg = reg_tmp.(i mod Array.length reg_tmp) in
@@ -266,18 +252,19 @@ let rec gen_expr env depth e =
         code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (8 + i * word_size)]
       done;
       
+      (* 设置参数 *)
+      List.iteri (fun i arg ->
+        let reg, c = gen_expr env (depth + i + 1) arg in
+        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
+      ) args;
+      
       (* 调用函数 *)
       code := !code @ [Printf.sprintf "call %s" fname];
       
-      (* 恢复寄存器 *)
+      (* 恢复临时寄存器 *)
       List.iteri (fun i reg ->
         code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (8 + i * word_size)]
       ) (List.rev !saved_regs);
-      
-      (* 恢复参数寄存器 *)
-      List.iteri (fun i _ ->
-        code := !code @ [Printf.sprintf "lw a%d, %d(sp)" i (-(i+1)*word_size)]
-      ) args;
       
       ("a0", !code)
 
@@ -361,19 +348,18 @@ let rec gen_stmt env depth code s =
 let gen_func (f : func) =
   let env = push_env () in
   let prologue = ref [] in
-  
   (* 参数分配 *)
   List.iteri (fun i name ->
     let ofs = alloc_var env name in
     prologue := !prologue @ [Printf.sprintf "sw a%d, %d(fp)" i ofs]
   ) f.params;
   
-  (* 计算栈大小：参数空间 + 局部变量 + 保存寄存器 + 对齐 *)
+  (* 计算需要的栈空间大小 *)
   let stack_size = 
     let params_size = List.length f.params * word_size in
     let locals_size = -env.cur_offset in
-    let saved_regs_size = 7 * word_size in (* 保存所有t0-t6 *)
-    ((params_size + locals_size + saved_regs_size + 15) / 16 * 16)
+    (* 对齐到16字节边界，并保留ra和fp的空间 *)
+    ((params_size + locals_size + 15) / 16) * 16
   in
   
   let ret_label = fresh_label (f.name ^ "_ret") in
@@ -389,25 +375,14 @@ let gen_func (f : func) =
     Printf.sprintf "addi sp, sp, -%d" stack_size;
     "sw ra, 0(sp)";
     "sw fp, 4(sp)";
-    Printf.sprintf "addi fp, sp, %d" (stack_size - 8)
+    Printf.sprintf "addi fp, sp, %d" (stack_size - 8)  (* fp指向保存的ra和fp之上 *)
   ];
-  
-  (* 保存所有临时寄存器 *)
-  for i = 0 to 6 do
-    code := !code @ [Printf.sprintf "sw t%d, %d(sp)" i (8 + i * word_size)]
-  done;
   
   code := !code @ !prologue;
   code := !code @ body_code;
   
   (* epilogue *)
   code := !code @ [Printf.sprintf "%s:" ret_label];
-  
-  (* 恢复临时寄存器 *)
-  for i = 0 to 6 do
-    code := !code @ [Printf.sprintf "lw t%d, %d(sp)" i (8 + i * word_size)]
-  done;
-  
   code := !code @ [
     "lw ra, 0(sp)";
     "lw fp, 4(sp)";
