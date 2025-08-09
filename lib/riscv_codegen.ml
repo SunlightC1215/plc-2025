@@ -1,7 +1,13 @@
 open Ast
 
-module StringMap = Map.Make(String)
-module VarEnv = Map.Make(String)
+(* Unique label generator for codegen *)
+let label_id = ref 0
+let fresh_label base =
+  let id = !label_id in
+  incr label_id;
+  Printf.sprintf ".L_%s_%d" base id
+
+(* ----- 语义分析环境定义 ----- *)
 type vinfo = {
   v_ty: [`Int];
   initialized: bool;
@@ -14,13 +20,26 @@ type fsign = {
 
 let global_funcs : func list ref = ref []
 
-type env = {
-  vars: (string, vinfo) Hashtbl.t;  (* 当前块的局部变量 *)
-  parent: env option;
-  breakable: bool;                  (* 是否在循环内部 *)
-  cur_func: fsign option;           (* 当前函数签名 *)
+type senv = {
+  vars: (string, vinfo) Hashtbl.t;
+  parent: senv option;
+  breakable: bool;
+  cur_func: fsign option;
 }
 
+let rec ends_with_return stmt =
+  match stmt with
+  | Return _ -> true
+  | Block stmts -> 
+      (* 如果语句块的最后一条语句是 Return *)
+      List.exists ends_with_return stmts
+  | If (_, then_blk, Some else_blk) ->
+      (* 只有 if-else 的两个分支都以 Return 结尾时才返回 true *)
+      ends_with_return then_blk && ends_with_return else_blk
+  | If (_, then_blk, None) ->
+      ends_with_return then_blk
+  | _ -> false  (* 其他语句不会导致函数返回 *)
+  
 let rec find_var env name =
   match Hashtbl.find_opt env.vars name with
   | Some v -> Some v
@@ -28,10 +47,6 @@ let rec find_var env name =
     (match env.parent with
     | Some p -> find_var p name
     | None -> None)
-
-let find_func funcs name =
-  try Some (List.find (fun f -> f.name = name) funcs)
-  with Not_found -> None
 
 let check_func_signatures (funcs:func list) =
   let tbl = Hashtbl.create 17 in
@@ -64,7 +79,7 @@ let rec analyze_expr env = function
       | _ -> failwith "Unary op requires int operand")
   | Call (fname, args) ->
       let funcs = !global_funcs in
-      (match find_func funcs fname with
+      (match List.find_opt (fun f -> f.name = fname) funcs with
       | None -> failwith ("Function not defined: " ^ fname)
       | Some f ->
           if List.length args <> List.length f.params then
@@ -89,16 +104,14 @@ and analyze_stmt env = function
       if Hashtbl.mem env.vars x then failwith ("Duplicated var: " ^ x);
       ignore(analyze_expr env e);
       Hashtbl.add env.vars x {v_ty=`Int;initialized=true}; false
-| Block stmts ->
-    let new_env = { 
-      vars=Hashtbl.create 32;
-      parent=Some env; 
-      breakable=env.breakable;
-      cur_func=env.cur_func 
-    } in
-    let returns = analyze_stmts new_env stmts in
-    (* 恢复父环境的变量状态 *)
-    returns
+  | Block stmts ->
+      let new_env = {
+        vars=Hashtbl.create 32;
+        parent=Some env;
+        breakable=env.breakable;
+        cur_func=env.cur_func
+      } in
+      analyze_stmts new_env stmts
   | If (cond, s_then, Some s_else) ->
       ignore(analyze_expr env cond);
       let r1 = analyze_stmt env s_then in
@@ -133,7 +146,6 @@ and analyze_stmts env stmts =
   let returns = List.map (analyze_stmt env) stmts in
   List.exists (fun x -> x) returns
 
-
 let analyze_func (f : func) =
   let env = {
     vars = Hashtbl.create 32;
@@ -141,7 +153,6 @@ let analyze_func (f : func) =
     breakable = false;
     cur_func = Some { ret_ty = f.ret_ty; params = f.params }
   } in
-  (* 参数声明 *)
   List.iter (fun name ->
     Hashtbl.add env.vars name { v_ty = `Int; initialized = true }
   ) f.params;
@@ -150,7 +161,261 @@ let analyze_func (f : func) =
   | `Int -> if not has_return then failwith (f.name ^ " not all paths return int")
   | `Void -> ()
 
-let analyze (prog:program) =
+let analyze (prog: program) =
   global_funcs := prog;
   check_func_signatures prog;
   List.iter analyze_func prog
+
+(* ----- 代码生成部分 ----- *)
+let word_size = 4
+
+type cenv = {
+  stack_offset : (string, int) Hashtbl.t;
+  mutable cur_offset : int;
+  parent : cenv option;
+  break_label : string option;
+  continue_label : string option;
+  mutable ret_label : string;
+}
+
+let push_env () = { stack_offset=Hashtbl.create 16; cur_offset=0; parent=None; break_label=None; continue_label=None; ret_label="" }
+
+let push_block_env parent_env = {
+  stack_offset = Hashtbl.create 16;
+  cur_offset = parent_env.cur_offset;
+  parent = Some parent_env;
+  break_label = parent_env.break_label;
+  continue_label = parent_env.continue_label;
+  ret_label = parent_env.ret_label;
+}
+
+let alloc_var env name =
+  env.cur_offset <- env.cur_offset - word_size;
+  Hashtbl.add env.stack_offset name env.cur_offset;
+  env.cur_offset
+
+let rec find_var env name =
+  match Hashtbl.find_opt env.stack_offset name with
+  | Some ofs -> ofs
+  | None ->
+    match env.parent with
+    | Some p -> find_var p name
+    | None -> failwith ("undefined variable: " ^ name)
+
+let reg_tmp = [|"t0";"t1";"t2";"t3";"t4";"t5";"t6"|]
+
+let rec gen_expr env depth e =
+  match e with
+  | Int n ->
+      let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+      (reg, [Printf.sprintf "li %s, %d" reg n])
+  | Var x ->
+      let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+      let ofs = find_var env x in
+      (reg, [Printf.sprintf "lw %s, %d(fp)" reg ofs])
+  | BinOp (op, a, b) ->
+    let reg1, code1 = gen_expr env depth a in
+    let reg2, code2 = gen_expr env (depth + 1) b in
+    let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+    let opstr, extra =
+      match op with
+      | Add -> "add", ""
+      | Sub -> "sub", ""
+      | Mul -> "mul", ""
+      | Div -> "div", ""
+      | Mod -> "rem", ""
+      | Lt  -> "slt", ""
+      | Gt  -> "sgt", ""
+      | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b ≡ !(a > b) *)
+      | Ge  -> "sge", ""
+      | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
+      | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
+      | And -> "and", ""
+      | Or  -> "or", ""
+    in
+    let code = code1 @ code2 @ [Printf.sprintf "%s %s, %s, %s%s" opstr reg reg1 reg2 extra] in
+    (reg, code)
+  | UnOp (Neg, e) ->
+      let reg, code = gen_expr env depth e in
+      (reg, code @ [Printf.sprintf "neg %s, %s" reg reg])
+  | UnOp (Not, e) ->
+      let reg, code = gen_expr env depth e in
+      (reg, code @ [Printf.sprintf "seqz %s, %s" reg reg])
+  | UnOp (Pos, e) ->
+      let reg, code = gen_expr env depth e in
+      (reg, code)
+  | Call (fname, args) ->
+      let code = ref [] in
+      
+      (* 保存参数寄存器 *)
+      List.iteri (fun i _ ->
+        code := !code @ [Printf.sprintf "sw a%d, %d(sp)" i (-(i+1)*word_size)]
+      ) args;
+      
+      (* 设置参数 *)
+      List.iteri (fun i arg ->
+        let reg, c = gen_expr env (depth + i + 1) arg in
+        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
+      ) args;
+      
+      (* 保存调用者保存的寄存器 *)
+      let saved_regs = ref [] in
+      for i = 0 to depth do
+        let reg = reg_tmp.(i mod Array.length reg_tmp) in
+        saved_regs := reg :: !saved_regs;
+        code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (8 + i * word_size)]
+      done;
+      
+      (* 调用函数 *)
+      code := !code @ [Printf.sprintf "call %s" fname];
+      
+      (* 恢复寄存器 *)
+      List.iteri (fun i reg ->
+        code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (8 + i * word_size)]
+      ) (List.rev !saved_regs);
+      
+      (* 恢复参数寄存器 *)
+      List.iteri (fun i _ ->
+        code := !code @ [Printf.sprintf "lw a%d, %d(sp)" i (-(i+1)*word_size)]
+      ) args;
+      
+      ("a0", !code)
+
+let rec gen_stmt env depth code s =
+  match s with
+  | Empty -> code
+  | Expr e ->
+      let _, c = gen_expr env depth e in
+      code @ c
+  | Assign (x, e) ->
+      let reg, c = gen_expr env depth e in
+      let ofs = find_var env x in
+      code @ c @ [Printf.sprintf "sw %s, %d(fp)" reg ofs]
+  | Decl (x, e) ->
+      let ofs = alloc_var env x in
+      let reg, c = gen_expr env depth e in
+      code @ c @ [Printf.sprintf "sw %s, %d(fp)" reg ofs]
+  | Block ss ->
+      let block_env = push_block_env env in
+      List.fold_left (fun acc s -> gen_stmt block_env depth acc s) code ss
+  | If (cond, s_then, Some s_else) ->
+      let l_else = fresh_label "else" in
+      let l_end = fresh_label "endif" in
+      let reg, ccond = gen_expr env depth cond in
+      let c_then = gen_stmt env depth [] s_then in
+      let c_else = gen_stmt env depth [] s_else in
+      
+      (* 检查分支是否以 Return 结尾 *)
+      let then_returns = ends_with_return s_then in
+      let else_returns = ends_with_return s_else in
+      
+      code @ ccond @
+      [Printf.sprintf "beqz %s, %s" reg l_else] @
+      c_then @
+      (* 只有 then 分支没有 Return 时才需要跳转到 endif *)
+      (if not then_returns then [Printf.sprintf "j %s" l_end] else []) @
+      [Printf.sprintf "%s:" l_else] @
+      c_else @
+      (* 只有至少一个分支没有 Return 时才需要 endif 标签 *)
+      (if not (then_returns && else_returns) then [Printf.sprintf "%s:" l_end] else [])
+
+  | If (cond, s_then, None) ->
+      let l_end = fresh_label "endif" in
+      let reg, ccond = gen_expr env depth cond in
+      let c_then = gen_stmt env depth [] s_then in
+      (* 检查 then 分支是否以 Return 结尾 *)
+      let then_returns = ends_with_return s_then in
+      code @ ccond @
+      [Printf.sprintf "beqz %s, %s" reg l_end] @
+      c_then @
+      (if not then_returns then [Printf.sprintf "%s:" l_end] else [])
+  | While (cond, body) ->
+      let l_cond = fresh_label "while_cond" in
+      let l_end = fresh_label "while_end" in
+      let l_body = fresh_label "while_body" in
+      let reg, ccond = gen_expr env depth cond in
+      let env' = { env with break_label=Some l_end; continue_label=Some l_cond } in
+      let c_body = gen_stmt env' depth [] body in
+      code @
+      [Printf.sprintf "%s:" l_cond] @ ccond
+      @ [Printf.sprintf "beqz %s, %s" reg l_end]
+      @ [Printf.sprintf "%s:" l_body] @ c_body
+      @ [Printf.sprintf "j %s" l_cond; Printf.sprintf "%s:" l_end]
+  | Break ->
+      (match env.break_label with
+      | Some l -> code @ [Printf.sprintf "j %s" l]
+      | None -> failwith "break not in loop")
+  | Continue ->
+      (match env.continue_label with
+      | Some l -> code @ [Printf.sprintf "j %s" l]
+      | None -> failwith "continue not in loop")
+  | Return None ->
+      code @ [Printf.sprintf "j %s" env.ret_label]
+  | Return (Some e) ->
+      let reg, c = gen_expr env depth e in
+      code @ c @ [
+        Printf.sprintf "mv a0, %s" reg;
+        Printf.sprintf "j %s" env.ret_label
+      ]
+
+let gen_func (f : func) =
+  let env = push_env () in
+  let prologue = ref [] in
+  
+  (* 参数分配 *)
+  List.iteri (fun i name ->
+    let ofs = alloc_var env name in
+    prologue := !prologue @ [Printf.sprintf "sw a%d, %d(fp)" i ofs]
+  ) f.params;
+  
+  (* 计算栈大小：参数空间 + 局部变量 + 保存寄存器 + 对齐 *)
+  let stack_size = 
+    let params_size = List.length f.params * word_size in
+    let locals_size = -env.cur_offset in
+    let saved_regs_size = 7 * word_size in (* 保存所有t0-t6 *)
+    ((params_size + locals_size + saved_regs_size + 15) / 16 * 16)
+  in
+  
+  let ret_label = fresh_label (f.name ^ "_ret") in
+  env.ret_label <- ret_label;
+  
+  let body_code = List.fold_left (fun acc s -> gen_stmt env 0 acc s) [] f.body in
+  
+  let code = ref [] in
+  code := !code @ [Printf.sprintf ".globl %s" f.name; Printf.sprintf "%s:" f.name];
+  
+  (* 新的prologue *)
+  code := !code @ [
+    Printf.sprintf "addi sp, sp, -%d" stack_size;
+    "sw ra, 0(sp)";
+    "sw fp, 4(sp)";
+    Printf.sprintf "addi fp, sp, %d" (stack_size - 8)
+  ];
+  
+  (* 保存所有临时寄存器 *)
+  for i = 0 to 6 do
+    code := !code @ [Printf.sprintf "sw t%d, %d(sp)" i (8 + i * word_size)]
+  done;
+  
+  code := !code @ !prologue;
+  code := !code @ body_code;
+  
+  (* epilogue *)
+  code := !code @ [Printf.sprintf "%s:" ret_label];
+  
+  (* 恢复临时寄存器 *)
+  for i = 0 to 6 do
+    code := !code @ [Printf.sprintf "lw t%d, %d(sp)" i (8 + i * word_size)]
+  done;
+  
+  code := !code @ [
+    "lw ra, 0(sp)";
+    "lw fp, 4(sp)";
+    Printf.sprintf "addi sp, sp, %d" stack_size;
+    "ret"
+  ];
+  
+  String.concat "\n" !code
+
+let gen_program (prog : program) : string =
+  String.concat "\n\n" (List.map gen_func prog)

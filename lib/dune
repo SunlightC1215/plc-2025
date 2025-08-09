@@ -1,7 +1,7 @@
 (library
  (name toyc_lib)
  (modules ast lexer parser semantic riscv_codegen)
- (libraries menhirLib)
+ (wrapped false)
 )
 (menhir
  (modules parser))
