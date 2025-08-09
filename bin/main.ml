@@ -1,16 +1,39 @@
-let () =
-  let filename = Sys.argv.(1) in
-  let ic = open_in filename in
-  let lexbuf = Lexing.from_channel ic in
+
+(* 读取标准输入的全部内容 *)
+let read_all_input () =
+  let buf = Buffer.create 4096 in
   try
-    let prog = Parser.main Lexer.read lexbuf in
-    close_in ic;
-    Semantic.analyze prog;
-    let asm = Riscv_codegen.gen_program prog in
+    while true do
+      Buffer.add_string buf (read_line ());
+      Buffer.add_char buf '\n'
+    done;
+    assert false (* 永远不会执行到这里 *)
+  with End_of_file ->
+    Buffer.contents buf
+
+(* 主函数：从标准输入读取代码，编译并输出汇编 *)
+let () =
+  try
+    (* 1. 从标准输入读取全部代码 *)
+    let code = read_all_input () in
+    
+    (* 2. 词法分析 *)
+    let lexbuf = Lexing.from_string code in
+    (* 3. 语法分析 - 直接传递 lexbuf 给解析器 *)
+    let ast = Parser.main Lexer.read lexbuf in
+    
+    (* 4. 语义分析 *)
+    Semantic.analyze ast;
+    
+    (* 5. 代码生成 *)
+    let asm = Riscv_codegen.gen_program ast in
+    
+    (* 6. 输出汇编代码 *)
     print_endline asm
   with
-    | Parser.Error ->
-        let pos = lexbuf.Lexing.lex_curr_p in
-        Printf.eprintf "Syntax error at line %d, column %d\n" pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol);
-        close_in ic
-    | e -> close_in ic; raise e
+  | Parser.Error -> 
+      prerr_endline "Syntax error"; exit 1
+  | Failure msg -> 
+      prerr_endline ("Semantic error: " ^ msg); exit 1
+  | ex -> 
+      prerr_endline ("Unexpected error: " ^ Printexc.to_string ex); exit 1
