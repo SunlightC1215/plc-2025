@@ -1,8 +1,8 @@
-(library
- (name toyc_lib)
- (modules ast lexer parser semantic riscv_codegen)
- (libraries menhirLib)
+(executable
+ (name main)
+ (modules ast lexer parser semantic riscv_codegen main)
 )
+
 (menhir
  (modules parser))
 
