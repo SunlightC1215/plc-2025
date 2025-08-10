@@ -372,7 +372,7 @@ let gen_func (f : func) =
     Printf.sprintf "addi sp, sp, -%d" stack_size;   (* 为整个栈帧预留空间 *)
     "sw ra, 0(sp)";                               (* 保存返回地址 *)
     "sw fp, 4(sp)";                               (* 保存旧的帧指针 *)
-    Printf.sprintf "addi fp, sp, %d" (stack_size - 8) (* fp 指向保存 ra/fp 之上的位置 *)
+    Printf.sprintf "addi fp, sp, %d" (stack_size) (* fp 指向保存 ra/fp 之上的位置 *)
   ] in
 
   (* 6. 将形参保存到栈槽中。此时 fp 已经就位，偏移量已经在 env.stack_offset 里 *)
