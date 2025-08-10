@@ -20,9 +20,10 @@ type fsign = {
 let rec ends_with_return stmt =
   match stmt with
   | Return _ -> true
-  | Block stmts -> 
-      (* 如果语句块的最后一条语句是 Return *)
-      List.exists ends_with_return stmts
+  | Block stmts ->
+    (match List.rev stmts with
+     | [] -> false
+     | last :: _ -> ends_with_return last)
   | If (_, then_blk, Some else_blk) ->
       (* 只有 if-else 的两个分支都以 Return 结尾时才返回 true *)
       ends_with_return then_blk && ends_with_return else_blk
@@ -299,35 +300,30 @@ let rec gen_stmt env depth code s =
       List.fold_left (fun acc s -> gen_stmt block_env depth acc s) code ss
   | If (cond, s_then, Some s_else) ->
       let l_else = fresh_label "else" in
-      let l_end = fresh_label "endif" in
+      let l_end  = fresh_label "endif" in
       let reg, ccond = gen_expr env depth cond in
       let c_then = gen_stmt env depth [] s_then in
       let c_else = gen_stmt env depth [] s_else in
-      
-      (* 检查分支是否以 Return 结尾 *)
       let then_returns = ends_with_return s_then in
       let else_returns = ends_with_return s_else in
-      
       code @ ccond @
       [Printf.sprintf "beqz %s, %s" reg l_else] @
       c_then @
-      (* 只有 then 分支没有 Return 时才需要跳转到 endif *)
       (if not then_returns then [Printf.sprintf "j %s" l_end] else []) @
       [Printf.sprintf "%s:" l_else] @
       c_else @
-      (* 只有至少一个分支没有 Return 时才需要 endif 标签 *)
+      (* 只要 **任意** 分支不返回，就必须有结束标签 *)
       (if not (then_returns && else_returns) then [Printf.sprintf "%s:" l_end] else [])
-
   | If (cond, s_then, None) ->
       let l_end = fresh_label "endif" in
       let reg, ccond = gen_expr env depth cond in
       let c_then = gen_stmt env depth [] s_then in
-      (* 检查 then 分支是否以 Return 结尾 *)
       let then_returns = ends_with_return s_then in
       code @ ccond @
       [Printf.sprintf "beqz %s, %s" reg l_end] @
       c_then @
-      (if not then_returns then [Printf.sprintf "%s:" l_end] else [])
+      (if not then_returns then [Printf.sprintf "j %s" l_end] else []) @
+      [Printf.sprintf "%s:" l_end]   (* ← **始终**输出结束标签 *)
   | While (cond, body) ->
       let l_cond = fresh_label "while_cond" in
       let l_end = fresh_label "while_end" in
