@@ -213,9 +213,21 @@ let rec gen_expr env depth e =
       let ofs = find_var env x in
       (reg, [Printf.sprintf "lw %s, %d(fp)" reg ofs])
   | BinOp (op, a, b) ->
-    let reg1, code1 = gen_expr env depth a in
-    let reg2, code2 = gen_expr env (depth + 1) b in
-    let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+    (* 先生成左操作数的代码 *)
+    let left_reg, left_code = gen_expr env depth a in
+
+    (* 将左侧结果搬到一个安全的寄存器 t6（若已经在 t6 则省略） *)
+    let save_left =
+      if left_reg = "t6" then []               (* 已经在 t6，不必再搬 *)
+      else [Printf.sprintf "mv t6, %s" left_reg] in
+
+    (* 再生成右操作数的代码 *)
+    let right_reg, right_code = gen_expr env (depth + 1) b in
+
+    (* 目的寄存器：使用深度对应的临时寄存器 *)
+    let dst_reg = reg_tmp.(depth mod Array.length reg_tmp) in
+
+    (* 选出对应的指令及可能的额外代码 *)
     let opstr, extra =
       match op with
       | Add -> "add", ""
@@ -225,15 +237,23 @@ let rec gen_expr env depth e =
       | Mod -> "rem", ""
       | Lt  -> "slt", ""
       | Gt  -> "sgt", ""
-      | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b ≡ !(a > b) *)
+      | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" dst_reg dst_reg
       | Ge  -> "sge", ""
-      | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
-      | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
+      | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" dst_reg dst_reg
+      | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" dst_reg dst_reg
       | And -> "and", ""
       | Or  -> "or", ""
     in
-    let code = code1 @ code2 @ [Printf.sprintf "%s %s, %s, %s%s" opstr reg reg1 reg2 extra] in
-    (reg, code)
+
+    (* 组合所有指令 *)
+    let binop_instr =
+      Printf.sprintf "%s %s, t6, %s%s"
+        opstr dst_reg right_reg extra
+    in
+
+    (* 完整代码序列 *)
+    (dst_reg,
+     left_code @ save_left @ right_code @ [binop_instr])
   | UnOp (Neg, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code @ [Printf.sprintf "neg %s, %s" reg reg])
