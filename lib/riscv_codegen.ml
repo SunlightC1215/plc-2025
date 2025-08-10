@@ -167,6 +167,10 @@ let analyze (prog: program) =
 
 (* ----- 代码生成部分 ----- *)
 let word_size = 4
+let reg_tmp = [|"t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6"|]
+
+let tmp_reg_of_depth depth =
+  reg_tmp.(depth mod Array.length reg_tmp)
 
 type cenv = {
   stack_offset : (string, int) Hashtbl.t;
@@ -180,8 +184,8 @@ type cenv = {
 let push_env () = { stack_offset=Hashtbl.create 16; cur_offset=0; parent=None; break_label=None; continue_label=None; ret_label="" }
 
 let push_block_env parent_env = {
-  stack_offset = Hashtbl.create 16;
-  cur_offset = parent_env.cur_offset;
+  stack_offset = Hashtbl.create 16;          (* 只复制名字表 *)
+  cur_offset = parent_env.cur_offset;       (* 初始值拷贝，后面会回写 *)
   parent = Some parent_env;
   break_label = parent_env.break_label;
   continue_label = parent_env.continue_label;
@@ -201,40 +205,49 @@ let rec find_var env name =
     | Some p -> find_var p name
     | None -> failwith ("undefined variable: " ^ name)
 
-let reg_tmp = [|"t0";"t1";"t2";"t3";"t4";"t5";"t6"|]
 
 let rec gen_expr env depth e =
   match e with
   | Int n ->
-      let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+      let reg = tmp_reg_of_depth depth in
       (reg, [Printf.sprintf "li %s, %d" reg n])
+
   | Var x ->
-      let reg = reg_tmp.(depth mod Array.length reg_tmp) in
+      let reg = tmp_reg_of_depth depth in
       let ofs = find_var env x in
       (reg, [Printf.sprintf "lw %s, %d(fp)" reg ofs])
+
+  (* ----------------------------------------------------------- *)
+  (* 二元运算：左值先保存，右值求完后再恢复左值                *)
+  (* ----------------------------------------------------------- *)
   | BinOp (op, a, b) ->
-      (* 1️⃣ 先生成左操作数的代码，得到左结果所在寄存器 *)
-      let left_reg, left_code = gen_expr env depth a in
+    (* ① 生成左子表达式 *)
+    let left_reg, left_code = gen_expr env depth a in
 
-      (* 2️⃣ 为了在右操作数生成期间保持左结果不被覆盖，
-            把左结果压入栈。栈帧始终保持 16‑字节对齐，
-            因而这里一次性向下扩展 16 B（剩余 12 B 只是填充） *)
-      let save_area = 16 in
-      let push_code = [
-        Printf.sprintf "addi sp, sp, -%d" save_area;
-        Printf.sprintf "sw %s, 0(sp)" left_reg
-      ] in
+    (* ② 若左子结果恰好在 a0（函数返回值），先搬到临时寄存器 *)
+    let left_reg', left_move_code =
+      if left_reg = "a0" then
+        let tmp = tmp_reg_of_depth (depth + 100) in
+        (tmp, [Printf.sprintf "mv %s, a0" tmp])
+      else (left_reg, []) in
 
-      (* 3️⃣ 生成右操作数的代码 *)
-      let right_reg, right_code = gen_expr env (depth + 1) b in
+    (* ③ 保存左子值到栈（16 B 对齐） *)
+    let save_area = 16 in
+    let push_code = [
+      Printf.sprintf "addi sp, sp, -%d" save_area;
+      Printf.sprintf "sw %s, 0(sp)" left_reg'
+    ] in
 
-      (* 4️⃣ 右操作数结束后把左结果弹回 *)
-      let pop_code = [
-        Printf.sprintf "lw %s, 0(sp)" left_reg;
-        Printf.sprintf "addi sp, sp, %d" save_area
-      ] in
+    (* ④ 生成右子表达式 *)
+    let right_reg, right_code = gen_expr env (depth + 1) b in
 
-      (* 5️⃣ 选取用于该二元运算的指令以及可能的额外指令 *)
+    (* ⑤ 弹回左子值到 **另一个**临时寄存器 *)
+    let left_back_reg = tmp_reg_of_depth (depth + 200) in
+    let pop_code = [
+      Printf.sprintf "lw %s, 0(sp)" left_back_reg;
+      Printf.sprintf "addi sp, sp, %d" save_area
+    ] in
+      (* 5️⃣ 选取对应的指令 *)
       let opstr, extra =
         match op with
         | Add -> "add", ""
@@ -244,67 +257,80 @@ let rec gen_expr env depth e =
         | Mod -> "rem", ""
         | Lt  -> "slt", ""
         | Gt  -> "sgt", ""
-        | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" left_reg left_reg
+        | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" left_back_reg left_back_reg
         | Ge  -> "sge", ""
-        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" left_reg left_reg
-        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" left_reg left_reg
+        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" left_back_reg left_back_reg
+        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" left_back_reg left_back_reg
         | And -> "and", ""
         | Or  -> "or", ""
       in
 
-      (* 6️⃣ 把所有代码拼起来：左代码 → 保存 → 右代码 → 恢复 → 计算 *)
+      (* 6️⃣ 组合所有代码 *)
       let final_code =
-        left_code @ push_code @ right_code @ pop_code @
-        [Printf.sprintf "%s %s, %s, %s%s" opstr left_reg left_reg right_reg extra]
+        left_code @ left_move_code @ push_code @
+        right_code @
+        pop_code @
+        [Printf.sprintf "%s %s, %s, %s%s"
+           opstr left_back_reg left_back_reg right_reg extra]
       in
-      (* 这里直接返回保存左结果的寄存器（已经被覆盖成运算结果） *)
-      (left_reg, final_code)
+
+      (* 7️⃣ 返回的寄存器是 left_back_reg（已经保存了运算结果），
+            后续的 `Return` 会把它搬到 a0。 *)
+      (left_back_reg, final_code)
+
   | UnOp (Neg, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code @ [Printf.sprintf "neg %s, %s" reg reg])
+
   | UnOp (Not, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code @ [Printf.sprintf "seqz %s, %s" reg reg])
+
   | UnOp (Pos, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code)
+
+  (* ----------------------------------------------------------- *)
+  (* Call：保存 caller‑saved 寄存器 → 调用 → 把返回值搬到 tmp *)
+  (* ----------------------------------------------------------- *)
   | Call (fname, args) ->
-      (* ----------  保存所有 t0‑t6（caller‑saved）  ---------- *)
-      let num_temps = Array.length reg_tmp in          (* 7 个寄存器   *)
-      (* 让保存区大小成为 16 的整数倍，防止破坏调用约定 *)
-      let raw_save = num_temps * word_size in
-      let save_area = ((raw_save + 15) / 16) * 16 in   (* 向上取整到 16 的倍数 *)
-      let code = ref [] in
+    let num_temps = Array.length reg_tmp in
+    let raw_save = num_temps * word_size in
+    let save_area = ((raw_save + 15) / 16) * 16 in   (* 16‑B 对齐 *)
+    let code = ref [] in
 
-      (* 为保存区腾出空间 *)
-      code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
+    (* 为保存区腾出空间 *)
+    code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
 
-      (* 把 t0‑t6 保存到新分配的栈区，偏移从 0 开始 *)
-      for i = 0 to num_temps - 1 do
-        let reg = reg_tmp.(i) in
-        code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (i * word_size)]
-      done;
+    (* 保存 t0‑t6（caller‑saved） *)
+    for i = 0 to num_temps - 1 do
+      let reg = reg_tmp.(i) in
+      code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (i * word_size)]
+    done;
 
-      (* ----------  生成实参并放入 a0‑aN  ---------- *)
-      List.iteri (fun i arg ->
-        let reg, c = gen_expr env (depth + i + 1) arg in
-        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
-      ) args;
+    (* 实参 → a0‑aN *)
+    List.iteri (fun i arg ->
+      let reg, c = gen_expr env (depth + i + 1) arg in
+      code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
+    ) args;
 
-      (* 调用函数 *)
-      code := !code @ [Printf.sprintf "call %s" fname];
+    (* 调用函数 *)
+    code := !code @ [Printf.sprintf "call %s" fname];
 
-      (* ----------  恢复寄存器  ---------- *)
-      for i = 0 to num_temps - 1 do
-        let reg = reg_tmp.(i) in
-        code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (i * word_size)]
-      done;
+    (* 恢复 t0‑t6 *)
+    for i = 0 to num_temps - 1 do
+      let reg = reg_tmp.(i) in
+      code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (i * word_size)]
+    done;
 
-      (* 释放保存区 *)
-      code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
+    (* 释放保存区 *)
+    code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
 
-      (* 返回值位于 a0，保持原来的约定 *)
-      ("a0", !code)
+    (* 把返回值搬到临时寄存器，供上层使用 *)
+    let tmp = tmp_reg_of_depth (depth + 300) in
+    code := !code @ [Printf.sprintf "mv %s, a0" tmp];
+    (tmp, !code)
+
 
 let rec gen_stmt env depth code s =
   match s with
@@ -321,8 +347,14 @@ let rec gen_stmt env depth code s =
       let reg, c = gen_expr env depth e in
       code @ c @ [Printf.sprintf "sw %s, %d(fp)" reg ofs]
   | Block ss ->
+      (* ① 新建仅保存名字的子作用域 *)
       let block_env = push_block_env env in
-      List.fold_left (fun acc s -> gen_stmt block_env depth acc s) code ss
+      (* ② 生成块内部代码 *)
+      let code' = List.fold_left (fun acc s -> gen_stmt block_env depth acc s) code ss in
+      (* ③ 把块里使用的最深栈偏移写回父环境 *)
+      if block_env.cur_offset < env.cur_offset then
+        env.cur_offset <- block_env.cur_offset;
+      code'
   | If (cond, s_then, Some s_else) ->
       let l_else = fresh_label "else" in
       let l_end  = fresh_label "endif" in
@@ -379,36 +411,32 @@ let rec gen_stmt env depth code s =
       ]
 
 let gen_func (f : func) =
-  (* --------------------------------------------------------------- *)
-  (* 1. 创建函数环境并分配所有形参的栈槽（仅记录偏移，不生成代码） *)
+  (* 1️⃣ 创建环境并为形参分配栈槽（仅记录偏移） *)
   let env = push_env () in
   List.iteri (fun _ name -> ignore (alloc_var env name)) f.params;
 
-  (* 2. 为本函数生成唯一的返回标签，并放进环境 *)
+  (* 2️⃣ 生成唯一返回标签 *)
   let ret_label = fresh_label (f.name ^ "_ret") in
   env.ret_label <- ret_label;
 
-  (* 3. 递归生成函数体代码。期间会为所有局部变量再次调用 alloc_var， 
-+      从而把 env.cur_offset 拉得更负，完整记录“参数+局部变量”占用了多少空间。 *)
+  (* 3️⃣ 递归生成函数体代码（顺便为局部变量再分配偏移） *)
   let body_code = List.fold_left (fun acc s -> gen_stmt env 0 acc s) [] f.body in
 
-  (* 4. 依据 env.cur_offset 计算实际需要的栈空间大小。               *)
-  (*    - env.cur_offset 现在是一个负数，   -env.cur_offset = 参数+局部变量的字节数 *)
-  (*    - 再加上保存 ra/fp 的 8 字节以及 16 字节对齐要求。          *)
-  let used_bytes = -env.cur_offset in               (* 参数 + 局部变量的总字节数 *)
+  (* 4️⃣ 计算栈大小：参数+局部变量+ra/fp，向上取整到 16 B *)
+  let used_bytes = -env.cur_offset in
   let stack_size = ((used_bytes + 8 + 15) / 16) * 16 in
 
-  (* 5. 生成函数序言（prologue） *)
+  (* 5️⃣ 序言 *)
   let prologue = [
     Printf.sprintf ".globl %s" f.name;
     Printf.sprintf "%s:" f.name;
     Printf.sprintf "addi sp, sp, -%d" stack_size;   (* 为整个栈帧预留空间 *)
-    "sw ra, 0(sp)";                               (* 保存返回地址 *)
-    "sw fp, 4(sp)";                               (* 保存旧的帧指针 *)
-    Printf.sprintf "addi fp, sp, %d" (stack_size) (* fp 指向保存 ra/fp 之上的位置 *)
+    "sw ra, 0(sp)";
+    "sw fp, 4(sp)";
+    Printf.sprintf "addi fp, sp, %d" stack_size   (* fp 指向原 sp，即保存 ra/fp 之上的位置 *)
   ] in
 
-  (* 6. 将形参保存到栈槽中。此时 fp 已经就位，偏移量已经在 env.stack_offset 里 *)
+  (* 6️⃣ 把形参保存到栈槽 *)
   let param_store =
     List.mapi (fun i name ->
         let ofs = Hashtbl.find env.stack_offset name in
@@ -416,7 +444,7 @@ let gen_func (f : func) =
       ) f.params
   in
 
-  (* 7. 生成函数尾声（epilogue） *)
+  (* 7️⃣ 结束序列（返回标签、恢复 ra/fp、释放栈） *)
   let epilogue = [
     Printf.sprintf "%s:" ret_label;
     "lw ra, 0(sp)";
