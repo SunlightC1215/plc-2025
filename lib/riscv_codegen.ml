@@ -301,25 +301,23 @@ let rec gen_expr env depth e =
     let save_area = ((Array.length reg_tmp * word_size + 15) / 16) * 16 in
     let code = ref [] in
 
-    (* ① 为 t0‑t6 的保存区腾出空间 *)
+    (* ① 预留额外参数的栈空间（如果有的话） *)
+    if extra > 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, -%d" (extra * word_size)];
+
+    (* ② 为 t0‑t6 的保存区腾出空间 *)
     code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
     for i = 0 to Array.length reg_tmp - 1 do
       code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg_tmp.(i) (i*word_size)]
     done;
 
-    (* ② 预留额外参数的栈空间（一次性） *)
-    if extra > 0 then
-      code := !code @ [Printf.sprintf "addi sp, sp, -%d" (extra * word_size)];
-
-    (* ③ 现在把每个实参放到对应位置 *)
+    (* ③ 生成实参并放到正确位置 *)
     List.iteri (fun i arg ->
       let reg, c = gen_expr env (depth+i+1) arg in
       code := !code @ c;
       if i < max_arg_regs then
-        (* 前 8 个直接搬到 a0‑a7 *)
         code := !code @ [Printf.sprintf "mv a%d, %s" i reg]
       else
-        (* 第 i‑8 个放到刚才预留的栈槽里 *)
         let off = (i - max_arg_regs) * word_size in
         code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg off]
     ) args;
@@ -327,15 +325,15 @@ let rec gen_expr env depth e =
     (* ④ 调用函数 *)
     code := !code @ [Printf.sprintf "call %s" fname];
 
-    (* ⑤ 把额外参数的栈空间弹回 *)
-    if extra > 0 then
-      code := !code @ [Printf.sprintf "addi sp, sp, %d" (extra * word_size)];
-
-    (* ⑥ 恢复 t0‑t6 *)
+    (* ⑤ 恢复 t0‑t6 *)
     for i = 0 to Array.length reg_tmp - 1 do
       code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg_tmp.(i) (i*word_size)]
     done;
     code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
+
+    (* ⑥ 弹回额外参数空间 *)
+    if extra > 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, %d" (extra * word_size)];
 
     (* ⑦ 把返回值搬到临时寄存器供上层使用 *)
     let tmp = tmp_reg_of_depth (depth+300) in
@@ -452,11 +450,12 @@ let gen_func (f : func) =
   List.mapi (fun i name ->
     let ofs = Hashtbl.find env.stack_offset name in
     if i < max_arg_regs then
-      Printf.sprintf "sw a%d, %d(fp)" i ofs               (* a0‑a7 *)
+      (* 前 8 个寄存器参数 *)
+      Printf.sprintf "sw a%d, %d(fp)" i ofs
     else
-      (* 第 i‑8 个实参在调用者栈上，偏移 = 8 + (i‑8)*4 *)
-      Printf.sprintf "lw t0, %d(fp)\nsw t0, %d(fp)"
-        ((i - max_arg_regs) * word_size + 8) ofs
+      (* 第 9、10 … 个参数已经在调用者栈上，偏移从 0(fp) 开始 *)
+      let off = (i - max_arg_regs) * word_size in
+      Printf.sprintf "lw t0, %d(sp)\nsw t0, %d(fp)" off ofs
   ) f.params
   in
 
