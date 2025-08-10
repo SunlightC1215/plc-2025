@@ -213,27 +213,52 @@ let rec gen_expr env depth e =
       let ofs = find_var env x in
       (reg, [Printf.sprintf "lw %s, %d(fp)" reg ofs])
   | BinOp (op, a, b) ->
-    let reg1, code1 = gen_expr env depth a in
-    let reg2, code2 = gen_expr env (depth + 1) b in
-    let reg = reg_tmp.(depth mod Array.length reg_tmp) in
-    let opstr, extra =
-      match op with
-      | Add -> "add", ""
-      | Sub -> "sub", ""
-      | Mul -> "mul", ""
-      | Div -> "div", ""
-      | Mod -> "rem", ""
-      | Lt  -> "slt", ""
-      | Gt  -> "sgt", ""
-      | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" reg reg  (* a <= b ≡ !(a > b) *)
-      | Ge  -> "sge", ""
-      | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" reg reg
-      | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" reg reg
-      | And -> "and", ""
-      | Or  -> "or", ""
-    in
-    let code = code1 @ code2 @ [Printf.sprintf "%s %s, %s, %s%s" opstr reg reg1 reg2 extra] in
-    (reg, code)
+      (* 1️⃣ 先生成左操作数的代码，得到左结果所在寄存器 *)
+      let left_reg, left_code = gen_expr env depth a in
+
+      (* 2️⃣ 为了在右操作数生成期间保持左结果不被覆盖，
+            把左结果压入栈。栈帧始终保持 16‑字节对齐，
+            因而这里一次性向下扩展 16 B（剩余 12 B 只是填充） *)
+      let save_area = 16 in
+      let push_code = [
+        Printf.sprintf "addi sp, sp, -%d" save_area;
+        Printf.sprintf "sw %s, 0(sp)" left_reg
+      ] in
+
+      (* 3️⃣ 生成右操作数的代码 *)
+      let right_reg, right_code = gen_expr env (depth + 1) b in
+
+      (* 4️⃣ 右操作数结束后把左结果弹回 *)
+      let pop_code = [
+        Printf.sprintf "lw %s, 0(sp)" left_reg;
+        Printf.sprintf "addi sp, sp, %d" save_area
+      ] in
+
+      (* 5️⃣ 选取用于该二元运算的指令以及可能的额外指令 *)
+      let opstr, extra =
+        match op with
+        | Add -> "add", ""
+        | Sub -> "sub", ""
+        | Mul -> "mul", ""
+        | Div -> "div", ""
+        | Mod -> "rem", ""
+        | Lt  -> "slt", ""
+        | Gt  -> "sgt", ""
+        | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" left_reg left_reg
+        | Ge  -> "sge", ""
+        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" left_reg left_reg
+        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" left_reg left_reg
+        | And -> "and", ""
+        | Or  -> "or", ""
+      in
+
+      (* 6️⃣ 把所有代码拼起来：左代码 → 保存 → 右代码 → 恢复 → 计算 *)
+      let final_code =
+        left_code @ push_code @ right_code @ pop_code @
+        [Printf.sprintf "%s %s, %s, %s%s" opstr left_reg left_reg right_reg extra]
+      in
+      (* 这里直接返回保存左结果的寄存器（已经被覆盖成运算结果） *)
+      (left_reg, final_code)
   | UnOp (Neg, e) ->
       let reg, code = gen_expr env depth e in
       (reg, code @ [Printf.sprintf "neg %s, %s" reg reg])
@@ -244,42 +269,42 @@ let rec gen_expr env depth e =
       let reg, code = gen_expr env depth e in
       (reg, code)
   | Call (fname, args) ->
-    (* ----------  保存所有 t0‑t6（caller‑saved）  ---------- *)
-    let num_temps = Array.length reg_tmp in          (* 7 个寄存器   *)
-   (* 让保存区大小成为 16 的整数倍，防止破坏调用约定 *)
-   let raw_save = num_temps * word_size in
-   let save_area = ((raw_save + 15) / 16) * 16 in   (* 向上取整到 16 的倍数 *)
-    let code = ref [] in
+      (* ----------  保存所有 t0‑t6（caller‑saved）  ---------- *)
+      let num_temps = Array.length reg_tmp in          (* 7 个寄存器   *)
+      (* 让保存区大小成为 16 的整数倍，防止破坏调用约定 *)
+      let raw_save = num_temps * word_size in
+      let save_area = ((raw_save + 15) / 16) * 16 in   (* 向上取整到 16 的倍数 *)
+      let code = ref [] in
 
-    (* 为保存区腾出空间 *)
-    code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
+      (* 为保存区腾出空间 *)
+      code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
 
-    (* 把 t0‑t6 保存到新分配的栈区，偏移从 0 开始 *)
-    for i = 0 to num_temps - 1 do
-      let reg = reg_tmp.(i) in
-      code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (i * word_size)]
-    done;
+      (* 把 t0‑t6 保存到新分配的栈区，偏移从 0 开始 *)
+      for i = 0 to num_temps - 1 do
+        let reg = reg_tmp.(i) in
+        code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (i * word_size)]
+      done;
 
-    (* ----------  生成实参并放入 a0‑aN  ---------- *)
-    List.iteri (fun i arg ->
-      let reg, c = gen_expr env (depth + i + 1) arg in
-      code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
-    ) args;
+      (* ----------  生成实参并放入 a0‑aN  ---------- *)
+      List.iteri (fun i arg ->
+        let reg, c = gen_expr env (depth + i + 1) arg in
+        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
+      ) args;
 
-    (* 调用函数 *)
-    code := !code @ [Printf.sprintf "call %s" fname];
+      (* 调用函数 *)
+      code := !code @ [Printf.sprintf "call %s" fname];
 
-    (* ----------  恢复寄存器  ---------- *)
-    for i = 0 to num_temps - 1 do
-      let reg = reg_tmp.(i) in
-      code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (i * word_size)]
-    done;
+      (* ----------  恢复寄存器  ---------- *)
+      for i = 0 to num_temps - 1 do
+        let reg = reg_tmp.(i) in
+        code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (i * word_size)]
+      done;
 
-    (* 释放保存区 *)
-    code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
+      (* 释放保存区 *)
+      code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
 
-    (* 返回值位于 a0，保持原来的约定 *)
-    ("a0", !code)
+      (* 返回值位于 a0，保持原来的约定 *)
+      ("a0", !code)
 
 let rec gen_stmt env depth code s =
   match s with
