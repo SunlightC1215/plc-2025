@@ -243,30 +243,42 @@ let rec gen_expr env depth e =
       let reg, code = gen_expr env depth e in
       (reg, code)
   | Call (fname, args) ->
-      let code = ref [] in
-      (* 保存可能被调用破坏的临时寄存器 *)
-      let saved_regs = ref [] in
-      for i = 0 to depth do
-        let reg = reg_tmp.(i mod Array.length reg_tmp) in
-        saved_regs := reg :: !saved_regs;
-        code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (8 + i * word_size)]
-      done;
-      
-      (* 设置参数 *)
-      List.iteri (fun i arg ->
-        let reg, c = gen_expr env (depth + i + 1) arg in
-        code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
-      ) args;
-      
-      (* 调用函数 *)
-      code := !code @ [Printf.sprintf "call %s" fname];
-      
-      (* 恢复临时寄存器 *)
-      List.iteri (fun i reg ->
-        code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (8 + i * word_size)]
-      ) (List.rev !saved_regs);
-      
-      ("a0", !code)
+    (* ----------  保存所有 t0‑t6（caller‑saved）  ---------- *)
+    let num_temps = Array.length reg_tmp in          (* 7 个寄存器   *)
+   (* 让保存区大小成为 16 的整数倍，防止破坏调用约定 *)
+   let raw_save = num_temps * word_size in
+   let save_area = ((raw_save + 15) / 16) * 16 in   (* 向上取整到 16 的倍数 *)
+    let code = ref [] in
+
+    (* 为保存区腾出空间 *)
+    code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
+
+    (* 把 t0‑t6 保存到新分配的栈区，偏移从 0 开始 *)
+    for i = 0 to num_temps - 1 do
+      let reg = reg_tmp.(i) in
+      code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg (i * word_size)]
+    done;
+
+    (* ----------  生成实参并放入 a0‑aN  ---------- *)
+    List.iteri (fun i arg ->
+      let reg, c = gen_expr env (depth + i + 1) arg in
+      code := !code @ c @ [Printf.sprintf "mv a%d, %s" i reg]
+    ) args;
+
+    (* 调用函数 *)
+    code := !code @ [Printf.sprintf "call %s" fname];
+
+    (* ----------  恢复寄存器  ---------- *)
+    for i = 0 to num_temps - 1 do
+      let reg = reg_tmp.(i) in
+      code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg (i * word_size)]
+    done;
+
+    (* 释放保存区 *)
+    code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
+
+    (* 返回值位于 a0，保持原来的约定 *)
+    ("a0", !code)
 
 let rec gen_stmt env depth code s =
   match s with
