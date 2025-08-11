@@ -296,22 +296,28 @@ let rec gen_expr env depth e =
   (* ----------------------------------------------------------- *)
   (* Call：保存 caller‑saved 寄存器 → 调用 → 把返回值搬到 tmp *)
   (* ----------------------------------------------------------- *)
-  | Call (fname, args) ->
-    let extra = List.length args - max_arg_regs in
+   | Call (fname, args) ->
+    let extra = max 0 (List.length args - max_arg_regs) in
+    let bytes_for_args = extra * word_size in
     let save_area = ((Array.length reg_tmp * word_size + 15) / 16) * 16 in
+    (* 让 call 时 sp 16B 对齐：把 padding 放在“额外参数区之前” *)
+    let pad = (16 - ((save_area + bytes_for_args) mod 16)) mod 16 in
+
     let code = ref [] in
 
-    (* ① 预留额外参数的栈空间（如果有的话） *)
-    if extra > 0 then
-      code := !code @ [Printf.sprintf "addi sp, sp, -%d" (extra * word_size)];
-
-    (* ② 为 t0‑t6 的保存区腾出空间 *)
+    (* ① 为 t0..t6 腾保存区 *)
     code := !code @ [Printf.sprintf "addi sp, sp, -%d" save_area];
     for i = 0 to Array.length reg_tmp - 1 do
       code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg_tmp.(i) (i*word_size)]
     done;
 
-    (* ③ 生成实参并放到正确位置 *)
+    (* ② 先减 padding，再减额外参数区；这样 0(sp) 就是“额外参数基址” *)
+    if pad <> 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, -%d" pad];
+    if bytes_for_args > 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, -%d" bytes_for_args];
+
+    (* ③ 填实参 *)
     List.iteri (fun i arg ->
       let reg, c = gen_expr env (depth+i+1) arg in
       code := !code @ c;
@@ -319,23 +325,26 @@ let rec gen_expr env depth e =
         code := !code @ [Printf.sprintf "mv a%d, %s" i reg]
       else
         let off = (i - max_arg_regs) * word_size in
+        (* 现在 0(sp) 就是第9个实参的位置 *)
         code := !code @ [Printf.sprintf "sw %s, %d(sp)" reg off]
     ) args;
 
-    (* ④ 调用函数 *)
+    (* ④ 调用 *)
     code := !code @ [Printf.sprintf "call %s" fname];
 
-    (* ⑤ 恢复 t0‑t6 *)
+    (* ⑤ 回收额外参数区与 padding（对称） *)
+    if bytes_for_args > 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, %d" bytes_for_args];
+    if pad <> 0 then
+      code := !code @ [Printf.sprintf "addi sp, sp, %d" pad];
+
+    (* ⑥ 恢复 t0..t6 *)
     for i = 0 to Array.length reg_tmp - 1 do
       code := !code @ [Printf.sprintf "lw %s, %d(sp)" reg_tmp.(i) (i*word_size)]
     done;
     code := !code @ [Printf.sprintf "addi sp, sp, %d" save_area];
 
-    (* ⑥ 弹回额外参数空间 *)
-    if extra > 0 then
-      code := !code @ [Printf.sprintf "addi sp, sp, %d" (extra * word_size)];
-
-    (* ⑦ 把返回值搬到临时寄存器供上层使用 *)
+    (* ⑦ 返回值放到 tmp *)
     let tmp = tmp_reg_of_depth (depth+300) in
     code := !code @ [Printf.sprintf "mv %s, a0" tmp];
     (tmp, !code)
@@ -450,12 +459,11 @@ let gen_func (f : func) =
   List.mapi (fun i name ->
     let ofs = Hashtbl.find env.stack_offset name in
     if i < max_arg_regs then
-      (* 前 8 个寄存器参数 *)
       Printf.sprintf "sw a%d, %d(fp)" i ofs
     else
-      (* 第 9、10 … 个参数已经在调用者栈上，偏移从 0(fp) 开始 *)
       let off = (i - max_arg_regs) * word_size in
-      Printf.sprintf "lw t0, %d(sp)\nsw t0, %d(fp)" off ofs
+      (* 应该从调用者栈＝fp 开始读 *)
+      Printf.sprintf "lw t0, %d(fp)\nsw t0, %d(fp)" off ofs
   ) f.params
   in
 
