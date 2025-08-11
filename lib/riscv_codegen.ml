@@ -251,31 +251,34 @@ let rec gen_expr env depth e =
       Printf.sprintf "addi sp, sp, %d" save_area
     ] in
       (* 5️⃣ 选取对应的指令 *)
-      let opstr, extra =
-        match op with
-        | Add -> "add", ""
-        | Sub -> "sub", ""
-        | Mul -> "mul", ""
-        | Div -> "div", ""
-        | Mod -> "rem", ""
-        | Lt  -> "slt", ""
-        | Gt  -> "sgt", ""
-        | Le  -> "sgt", Printf.sprintf "\n\txori %s, %s, 1" left_back_reg left_back_reg
-        | Ge  -> "sge", ""
-        | Eq  -> "sub", Printf.sprintf "\n\tseqz %s, %s" left_back_reg left_back_reg
-        | Neq -> "sub", Printf.sprintf "\n\tsnez %s, %s" left_back_reg left_back_reg
-        | And -> "and", ""
-        | Or  -> "or", ""
-      in
+      let instrs =
+  match op with
+  | Add -> [Printf.sprintf "add %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Sub -> [Printf.sprintf "sub %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Mul -> [Printf.sprintf "mul %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Div -> [Printf.sprintf "div %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Mod -> [Printf.sprintf "rem %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Lt  -> [Printf.sprintf "slt %s, %s, %s" left_back_reg left_back_reg right_reg]              (* a < b *)
+  | Gt  -> [Printf.sprintf "slt %s, %s, %s" left_back_reg right_reg left_back_reg]              (* a > b : slt a,b,a *)
+  | Le  -> [Printf.sprintf "slt %s, %s, %s" left_back_reg right_reg left_back_reg;              (* a <= b : !(a > b) *)
+            Printf.sprintf "xori %s, %s, 1" left_back_reg left_back_reg]
+  | Ge  -> [Printf.sprintf "slt %s, %s, %s" left_back_reg left_back_reg right_reg;              (* a >= b : !(a < b) *)
+            Printf.sprintf "xori %s, %s, 1" left_back_reg left_back_reg]
+  | Eq  -> [Printf.sprintf "sub %s, %s, %s" left_back_reg left_back_reg right_reg;              (* a == b *)
+            Printf.sprintf "seqz %s, %s" left_back_reg left_back_reg]
+  | Neq -> [Printf.sprintf "sub %s, %s, %s" left_back_reg left_back_reg right_reg;              (* a != b *)
+            Printf.sprintf "snez %s, %s" left_back_reg left_back_reg]
+  | And -> [Printf.sprintf "and %s, %s, %s" left_back_reg left_back_reg right_reg]
+  | Or  -> [Printf.sprintf "or  %s, %s, %s" left_back_reg left_back_reg right_reg]
+in
 
-      (* 6️⃣ 组合所有代码 *)
-      let final_code =
-        left_code @ left_move_code @ push_code @
-        right_code @
-        pop_code @
-        [Printf.sprintf "%s %s, %s, %s%s"
-           opstr left_back_reg left_back_reg right_reg extra]
-      in
+(* ⑥ 组合所有代码 *)
+let final_code =
+  left_code @ left_move_code @ push_code @
+  right_code @
+  pop_code @
+  instrs
+in
 
       (* 7️⃣ 返回的寄存器是 left_back_reg（已经保存了运算结果），
             后续的 `Return` 会把它搬到 a0。 *)
